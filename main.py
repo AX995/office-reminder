@@ -1,7 +1,4 @@
-import sys
-import os
-import json
-import re
+import sys, os, json, re
 from datetime import datetime
 from PySide6.QtCore import Qt, QTimer, QTime, QDate
 from PySide6.QtWidgets import (
@@ -9,48 +6,41 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QPushButton, QLabel, QFileDialog,
     QComboBox, QTimeEdit, QSpinBox, QSystemTrayIcon, QMenu, QMessageBox,
     QDialog, QFormLayout, QLineEdit, QTabWidget, QStyle, QCheckBox,
-    QDateEdit, QTextEdit, QGroupBox
+    QDateEdit, QTextEdit, QGroupBox, QInputDialog, QGridLayout
 )
-from PySide6.QtGui import QIcon, QAction, QFont
+from PySide6.QtGui import QIcon, QAction, QFont, QPixmap, QPainter, QColor, QBrush, QPen
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
-CONFIG_FILE = "config.json"
-SETTINGS_FILE = "settings.json"
+# ---- 数据目录（统一放 AppData，不在桌面留文件） ----
+DATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "OfficeReminder")
+os.makedirs(DATA_DIR, exist_ok=True)
+CONFIG_FILE = os.path.join(DATA_DIR, "tasks.json")
+SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 
-# ==================== 单实例锁 ====================
-APP_KEY = "OfficeFolderManager_SingleInstance"
+APP_KEY = "OfficeReminder_SingleInstance_v2"
 
-# ==================== 文件夹名自动分类 ====================
-CLASSIFY_RULES = [
-    (r"(?:每周|周报|weekly|week)",              "每周任务"),
-    (r"(?:每月|月度|月报|monthly)",              "每月固定日任务"),
-    (r"(?:每天|每日|日报|daily|每\s*天|每\s*日)", "每日任务"),
-    (r"(?:每|every)",                           "每日任务"),
-]
+# ---- 内置分类规则（不可删除） ----
+BUILTIN_TABS = ["每日", "每周", "每月", "间隔"]
 
-TAB_ORDER = ["全部", "每日", "每周", "每月", "间隔", "自定义"]
-
-TYPE_TO_TAB = {
-    "每日任务":     "每日",
-    "每周任务":     "每周",
-    "每月固定日任务": "每月",
-    "间隔时间提醒":   "间隔",
-    "自定义提醒":    "自定义",
+BUILTIN_RULES = {
+    "每日": [r"每天", r"每日", r"日报", r"daily", r"每\s*天", r"每\s*日", r"每(?![周月])", r"every"],
+    "每周": [r"每周", r"周报", r"weekly", r"week"],
+    "每月": [r"每月", r"月度", r"月报", r"monthly", r"month"],
+    "间隔": [],  # 间隔类不靠关键词匹配，手动指定
 }
 
+def classify_folder_name(dirname, rules):
+    """按自定义规则匹配，返回标签名。优先匹配自定义标签再内置"""
+    for label, patterns in rules.items():
+        for pat in patterns:
+            if re.search(pat, dirname, re.IGNORECASE):
+                return label
+    return "每日"  # 默认
 
-def classify_folder_name(dirname: str) -> str:
-    for pattern, task_type in CLASSIFY_RULES:
-        if re.search(pattern, dirname, re.IGNORECASE):
-            return task_type
-    return "每日任务"
-
-
-def extract_day_from_name(dirname: str) -> int:
+def extract_day_from_name(dirname):
     m = re.search(r"(\d+)\s*(?:号|日|th|st|nd|rd)?", dirname, re.IGNORECASE)
     if m:
-        day = int(m.group(1))
-        return max(1, min(day, 31))
+        return max(1, min(31, int(m.group(1))))
     cn = {"一":1,"二":2,"三":3,"四":4,"五":5,"六":6,"七":7,"八":8,"九":9,"十":10,
           "十一":11,"十二":12,"十三":13,"十四":14,"十五":15,"十六":16,"十七":17,
           "十八":18,"十九":19,"二十":20,"二十一":21,"二十二":22,"二十三":23,
@@ -61,161 +51,122 @@ def extract_day_from_name(dirname: str) -> int:
             return num
     return 1
 
-
-# ==================== 全局设置 ====================
+# ---- Settings ----
 class Settings:
     def __init__(self):
-        self.data = {"watch_dirs": []}
+        self.data = {"watch_dirs": [], "custom_tabs": {}, "custom_reminders": []}
         self.load()
-
     def load(self):
         if os.path.exists(SETTINGS_FILE):
             try:
                 with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                     self.data = json.load(f)
-            except Exception:
-                pass
-
+            except: pass
     def save(self):
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(self.data, f, ensure_ascii=False, indent=2)
+    def get_all_rules(self):
+        """合并自定义+内置规则(自定义优先匹配)"""
+        rules = {}
+        for label, keywords in self.data.get("custom_tabs", {}).items():
+            patterns = [re.escape(k) for k in keywords]
+            rules[label] = patterns
+        for label, patterns in BUILTIN_RULES.items():
+            rules[label] = patterns
+        return rules
 
-
-# ==================== 数据管理 ====================
+# ---- TaskManager ----
 class TaskManager:
     def __init__(self):
         self.tasks = []
-        self.load_tasks()
-
-    def load_tasks(self):
+        self.load()
+    def load(self):
         if os.path.exists(CONFIG_FILE):
             try:
                 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                     self.tasks = json.load(f)
-            except Exception:
-                self.tasks = []
-        else:
-            self.tasks = []
-
-    def save_tasks(self):
+            except: self.tasks = []
+        else: self.tasks = []
+    def save(self):
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(self.tasks, f, ensure_ascii=False, indent=2)
-
     def get_by_path(self, path):
         for t in self.tasks:
             if t.get("path") == path:
                 return t
         return None
-
     def remove_by_path(self, path):
         self.tasks = [t for t in self.tasks if t.get("path") != path]
 
-# ==================== 文件夹任务对话框 ====================
+# ============== TaskDialog ==============
 class TaskDialog(QDialog):
-    def __init__(self, parent=None, task_data=None):
+    def __init__(self, parent=None, task_data=None, tab_labels=None, tab_type=None):
         super().__init__(parent)
         self.setWindowTitle("设置文件夹任务")
-        self.resize(420, 360)
+        self.resize(440, 380)
         self.task_data = task_data or {}
+        self.tab_labels = tab_labels or []
+        self.target_tab = tab_type or self.task_data.get("type", "每日")
         self.init_ui()
 
     def init_ui(self):
-        layout = QFormLayout(self)
-        layout.setSpacing(10)
+        layout = QFormLayout(self); layout.setSpacing(10)
 
         self.name_input = QLineEdit()
         self.name_input.setText(self.task_data.get("name", ""))
-        layout.addRow("任务名称:", self.name_input)
+        layout.addRow("名称:", self.name_input)
 
-        path_layout = QHBoxLayout()
+        pl = QHBoxLayout()
         self.path_input = QLineEdit()
         self.path_input.setText(self.task_data.get("path", ""))
-        browse_btn = QPushButton("浏览...")
-        browse_btn.clicked.connect(self.browse_path)
-        path_layout.addWidget(self.path_input)
-        path_layout.addWidget(browse_btn)
-        layout.addRow("文件夹路径:", path_layout)
+        b = QPushButton("浏览"); b.clicked.connect(lambda: self._browse())
+        pl.addWidget(self.path_input); pl.addWidget(b)
+        layout.addRow("路径:", pl)
 
+        # 类型选择 = Tab 标签
         self.type_combo = QComboBox()
-        self.type_combo.addItems(["每日任务", "每周任务", "每月固定日任务", "间隔时间提醒"])
-        current_type = self.task_data.get("type", "每日任务")
-        self.type_combo.setCurrentText(current_type)
-        self.type_combo.currentTextChanged.connect(self.on_type_changed)
-        layout.addRow("任务类型:", self.type_combo)
+        all_labels = ["每日", "每周", "每月", "间隔"] + [l for l in self.tab_labels if l not in ("每日","每周","每月","间隔","自定义","全部")]
+        self.type_combo.addItems(all_labels)
+        self.type_combo.setCurrentText(self.target_tab if self.target_tab in all_labels else "每日")
+        self.type_combo.currentTextChanged.connect(self._on_type_changed)
+        layout.addRow("归类标签:", self.type_combo)
 
-        # 闹钟开关
-        self.alarm_check = QCheckBox("启用提醒闹钟")
+        self.alarm_check = QCheckBox("启用提醒")
         self.alarm_check.setChecked(self.task_data.get("alarm_enabled", False))
         layout.addRow("", self.alarm_check)
 
         self.time_edit = QTimeEdit()
-        time_str = self.task_data.get("remind_time", "09:00")
-        self.time_edit.setTime(QTime.fromString(time_str, "HH:mm"))
+        self.time_edit.setTime(QTime.fromString(self.task_data.get("remind_time", "09:00"), "HH:mm"))
+        self.day_spin = QSpinBox(); self.day_spin.setRange(1,31); self.day_spin.setValue(self.task_data.get("remind_day",1))
+        self.interval_spin = QSpinBox(); self.interval_spin.setRange(5,1440); self.interval_spin.setSuffix(" 分钟"); self.interval_spin.setValue(self.task_data.get("interval",30))
 
-        self.day_spin = QSpinBox()
-        self.day_spin.setRange(1, 31)
-        self.day_spin.setValue(self.task_data.get("remind_day", 1))
+        self.tw = QWidget(); tl = QHBoxLayout(self.tw); tl.setContentsMargins(0,0,0,0); tl.addWidget(QLabel("时间:")); tl.addWidget(self.time_edit)
+        self.dw = QWidget(); dl = QHBoxLayout(self.dw); dl.setContentsMargins(0,0,0,0); dl.addWidget(QLabel("每月:")); dl.addWidget(self.day_spin); dl.addWidget(QLabel("号"))
+        self.iw = QWidget(); il = QHBoxLayout(self.iw); il.setContentsMargins(0,0,0,0); il.addWidget(QLabel("每隔:")); il.addWidget(self.interval_spin)
 
-        self.interval_spin = QSpinBox()
-        self.interval_spin.setRange(1, 1440)
-        self.interval_spin.setSuffix(" 分钟")
-        self.interval_spin.setValue(self.task_data.get("interval", 60))
+        layout.addRow("", self.tw); layout.addRow("", self.dw); layout.addRow("", self.iw)
+        self._on_type_changed(self.type_combo.currentText())
 
-        self.time_widget = QWidget()
-        tl = QHBoxLayout(self.time_widget)
-        tl.setContentsMargins(0, 0, 0, 0)
-        tl.addWidget(QLabel("提醒时间:"))
-        tl.addWidget(self.time_edit)
+        bl = QHBoxLayout(); bl.addStretch()
+        sb = QPushButton("保存"); sb.clicked.connect(self.accept)
+        cb = QPushButton("取消"); cb.clicked.connect(self.reject)
+        bl.addWidget(sb); bl.addWidget(cb); layout.addRow(bl)
 
-        self.day_widget = QWidget()
-        dl = QHBoxLayout(self.day_widget)
-        dl.setContentsMargins(0, 0, 0, 0)
-        dl.addWidget(QLabel("每月:"))
-        dl.addWidget(self.day_spin)
-        dl.addWidget(QLabel("号"))
+    def _browse(self):
+        p = QFileDialog.getExistingDirectory(self, "选择文件夹")
+        if p:
+            self.path_input.setText(p)
+            if not self.name_input.text(): self.name_input.setText(os.path.basename(p))
 
-        self.interval_widget = QWidget()
-        il = QHBoxLayout(self.interval_widget)
-        il.setContentsMargins(0, 0, 0, 0)
-        il.addWidget(QLabel("每隔:"))
-        il.addWidget(self.interval_spin)
-
-        layout.addRow("", self.time_widget)
-        layout.addRow("", self.day_widget)
-        layout.addRow("", self.interval_widget)
-
-        self.on_type_changed(self.type_combo.currentText())
-
-        btn_layout = QHBoxLayout()
-        save_btn = QPushButton("保存")
-        save_btn.clicked.connect(self.accept)
-        cancel_btn = QPushButton("取消")
-        cancel_btn.clicked.connect(self.reject)
-        btn_layout.addStretch()
-        btn_layout.addWidget(save_btn)
-        btn_layout.addWidget(cancel_btn)
-        layout.addRow(btn_layout)
-
-    def browse_path(self):
-        path = QFileDialog.getExistingDirectory(self, "选择办公文件夹")
-        if path:
-            self.path_input.setText(path)
-            if not self.name_input.text():
-                self.name_input.setText(os.path.basename(path))
-
-    def on_type_changed(self, text):
-        if text in ("每日任务", "每周任务"):
-            self.time_widget.show()
-            self.day_widget.hide()
-            self.interval_widget.hide()
-        elif text == "每月固定日任务":
-            self.time_widget.show()
-            self.day_widget.show()
-            self.interval_widget.hide()
-        elif text == "间隔时间提醒":
-            self.time_widget.hide()
-            self.day_widget.hide()
-            self.interval_widget.show()
+    def _on_type_changed(self, txt):
+        if txt in ("每日", "每周"):
+            self.tw.show(); self.dw.hide(); self.iw.hide()
+        elif txt == "每月":
+            self.tw.show(); self.dw.show(); self.iw.hide()
+        elif txt == "间隔":
+            self.tw.hide(); self.dw.hide(); self.iw.show()
+        else:
+            self.tw.show(); self.dw.hide(); self.iw.hide()
 
     def get_data(self):
         return {
@@ -228,641 +179,575 @@ class TaskDialog(QDialog):
             "alarm_enabled": self.alarm_check.isChecked(),
             "last_done": self.task_data.get("last_done", ""),
             "last_reminded": self.task_data.get("last_reminded", ""),
-            "is_custom": False,
+            "is_custom_reminder": False,
         }
 
-# ==================== 自定义提醒对话框 ====================
-class CustomTaskDialog(QDialog):
-    def __init__(self, parent=None, task_data=None):
+# ============== CustomReminderDialog ==============
+class CustomReminderDialog(QDialog):
+    def __init__(self, parent=None, data=None):
         super().__init__(parent)
-        self.setWindowTitle("自定义提醒任务")
-        self.resize(420, 380)
-        self.task_data = task_data or {}
+        self.setWindowTitle("自定义提醒"); self.resize(420, 380)
+        self.data = data or {}
         self.init_ui()
 
     def init_ui(self):
-        layout = QFormLayout(self)
-        layout.setSpacing(10)
+        layout = QFormLayout(self); layout.setSpacing(10)
 
         self.name_input = QLineEdit()
-        self.name_input.setText(self.task_data.get("name", ""))
-        self.name_input.setPlaceholderText("输入提醒内容...")
-        layout.addRow("提醒内容:", self.name_input)
+        self.name_input.setText(self.data.get("name", ""))
+        self.name_input.setPlaceholderText("提醒内容...")
+        layout.addRow("内容:", self.name_input)
 
-        # 提醒频率
-        freq_group = QGroupBox("提醒频率")
-        freq_layout = QVBoxLayout(freq_group)
+        g = QGroupBox("提醒频率"); gl = QVBoxLayout(g)
+        self.freq = QComboBox(); self.freq.addItems(["仅一次","每天","每周","每月","每年","间隔"]);
+        self.freq.setCurrentText(self.data.get("custom_freq","仅一次"))
+        self.freq.currentTextChanged.connect(self._on_freq)
+        gl.addWidget(self.freq)
 
-        self.freq_combo = QComboBox()
-        self.freq_combo.addItems(["仅一次", "每天", "每周", "每月", "每年"])
-        current_freq = self.task_data.get("custom_freq", "仅一次")
-        self.freq_combo.setCurrentText(current_freq)
-        self.freq_combo.currentTextChanged.connect(self.on_freq_changed)
-        freq_layout.addWidget(self.freq_combo)
+        self.dr = QHBoxLayout(); self.dr.addWidget(QLabel("日期:"));
+        self.de = QDateEdit(); self.de.setCalendarPopup(True)
+        ds = self.data.get("custom_date", QDate.currentDate().toString("yyyy-MM-dd"))
+        self.de.setDate(QDate.fromString(ds, "yyyy-MM-dd")); self.dr.addWidget(self.de)
 
-        # 日期
-        date_row = QHBoxLayout()
-        date_row.addWidget(QLabel("日期:"))
-        self.date_edit = QDateEdit()
-        date_str = self.task_data.get("custom_date", QDate.currentDate().toString("yyyy-MM-dd"))
-        self.date_edit.setDate(QDate.fromString(date_str, "yyyy-MM-dd"))
-        self.date_edit.setCalendarPopup(True)
-        date_row.addWidget(self.date_edit)
-        self.date_row = date_row
+        tr = QHBoxLayout(); tr.addWidget(QLabel("时间:"))
+        self.te = QTimeEdit(); self.te.setTime(QTime.fromString(self.data.get("remind_time","09:00"),"HH:mm")); tr.addWidget(self.te)
 
-        # 时间
-        time_row = QHBoxLayout()
-        time_row.addWidget(QLabel("时间:"))
-        self.time_edit = QTimeEdit()
-        time_str = self.task_data.get("remind_time", "09:00")
-        self.time_edit.setTime(QTime.fromString(time_str, "HH:mm"))
-        time_row.addWidget(self.time_edit)
+        self.ir = QHBoxLayout(); self.ir.addWidget(QLabel("间隔:"))
+        self.ie = QSpinBox(); self.ie.setRange(5,1440); self.ie.setSuffix(" 分钟"); self.ie.setValue(self.data.get("interval",30)); self.ir.addWidget(self.ie)
 
-        freq_layout.addLayout(date_row)
-        freq_layout.addLayout(time_row)
-        layout.addRow(freq_group)
+        gl.addLayout(self.dr); gl.addLayout(tr); gl.addLayout(self.ir)
+        layout.addRow(g)
 
-        # 备注
-        self.note_input = QTextEdit()
-        self.note_input.setMaximumHeight(80)
-        self.note_input.setPlaceholderText("可选：添加备注说明...")
-        self.note_input.setText(self.task_data.get("note", ""))
-        layout.addRow("备注:", self.note_input)
+        self.note = QTextEdit(); self.note.setMaximumHeight(60); self.note.setPlaceholderText("备注..."); self.note.setText(self.data.get("note",""))
+        layout.addRow("备注:", self.note)
+        self._on_freq(self.freq.currentText())
 
-        self.on_freq_changed(self.freq_combo.currentText())
+        bl = QHBoxLayout(); bl.addStretch()
+        sb = QPushButton("保存"); sb.clicked.connect(self.accept); cb = QPushButton("取消"); cb.clicked.connect(self.reject)
+        bl.addWidget(sb); bl.addWidget(cb); layout.addRow(bl)
 
-        btn_layout = QHBoxLayout()
-        save_btn = QPushButton("保存")
-        save_btn.clicked.connect(self.accept)
-        cancel_btn = QPushButton("取消")
-        cancel_btn.clicked.connect(self.reject)
-        btn_layout.addStretch()
-        btn_layout.addWidget(save_btn)
-        btn_layout.addWidget(cancel_btn)
-        layout.addRow(btn_layout)
 
-    def on_freq_changed(self, text):
-        if text == "仅一次":
-            self.date_row[0].setVisible(True)
-            self.date_edit.setVisible(True)
-        else:
-            self.date_row[0].setVisible(False)
-            self.date_edit.setVisible(False)
+
+    def _on_freq(self, txt):
+        is_once = (txt == "仅一次")
+        is_interval = (txt == "间隔")
+        # date row
+        for i in range(self.dr.count()):
+            w = self.dr.itemAt(i).widget()
+            if w: w.setVisible(is_once)
+        self.de.setVisible(is_once)
+        # time row
+        self.te.setVisible(not is_interval)
+        # interval row
+        for i in range(self.ir.count()):
+            w = self.ir.itemAt(i).widget()
+            if w: w.setVisible(is_interval)
+        self.ie.setVisible(is_interval)
 
     def get_data(self):
-        freq = self.freq_combo.currentText()
-        date_str = self.date_edit.date().toString("yyyy-MM-dd") if freq == "仅一次" else ""
+        freq = self.freq.currentText()
         return {
             "name": self.name_input.text().strip(),
-            "path": "",
-            "type": "自定义提醒",
-            "remind_time": self.time_edit.time().toString("HH:mm"),
+            "path": "", "type": "自定义",
+            "remind_time": self.te.time().toString("HH:mm"),
             "remind_day": 1,
-            "interval": 60,
+            "interval": self.ie.value(),
             "alarm_enabled": True,
-            "last_done": "",
-            "last_reminded": "",
-            "is_custom": True,
+            "last_done": "", "last_reminded": "",
+            "is_custom_reminder": True,
             "custom_freq": freq,
-            "custom_date": date_str,
-            "note": self.note_input.toPlainText().strip(),
+            "custom_date": self.de.date().toString("yyyy-MM-dd") if freq == "仅一次" else "",
+            "note": self.note.toPlainText().strip(),
         }
 
-# ==================== 主窗口 ====================
+# ============== MainWindow ==============
 class MainWindow(QMainWindow):
     def __init__(self, app):
         super().__init__()
         self.app = app
         self.mgr = TaskManager()
         self.settings = Settings()
-        self.setWindowTitle("办公文件夹统一管理助手")
-        self.resize(860, 560)
+        self.setWindowTitle("办公助手")
+        self.resize(920, 580)
         self._current_tab = "全部"
 
         self.init_ui()
         self.init_tray()
         self.refresh_all_tabs()
 
-        # 提醒定时器
-        self.remind_timer = QTimer(self)
-        self.remind_timer.timeout.connect(self.check_reminders)
-        self.remind_timer.start(30000)
+        self.remind_timer = QTimer(self); self.remind_timer.timeout.connect(self.check_reminders); self.remind_timer.start(30000)
 
-        # 文件夹同步定时器（每5分钟）
-        self.sync_timer = QTimer(self)
-        self.sync_timer.timeout.connect(self.auto_sync_folders)
+        self.sync_timer = QTimer(self); self.sync_timer.timeout.connect(self.auto_sync_folders)
         if self.settings.data.get("watch_dirs"):
-            self.sync_timer.start(300000)  # 5分钟
+            self.sync_timer.start(300000)
 
-    # ---------- UI ----------
+    # ---- UI ----
     def init_ui(self):
-        central = QWidget()
-        main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(8, 8, 8, 8)
-        main_layout.setSpacing(6)
+        c = QWidget(); ml = QVBoxLayout(c); ml.setContentsMargins(6,6,6,6); ml.setSpacing(4)
 
-        self.tab_bar = QTabWidget()
-        self.tab_bar.setDocumentMode(True)
-        self.tab_lists = {}
+        self.tab_bar = QTabWidget(); self.tab_bar.setDocumentMode(True)
+        self.tab_lists = {}; self.tab_order = []
 
-        for label in TAB_ORDER:
-            lst = QListWidget()
-            lst.setAlternatingRowColors(True)
+        self._rebuild_tabs()
+
+        self.tab_bar.currentChanged.connect(self.on_tab_changed)
+        ml.addWidget(self.tab_bar)
+
+        br = QHBoxLayout(); br.setSpacing(5)
+        btns = [
+            ("➕ 添加文件夹", self.add_task, "#333"),
+            ("📂 批量导入", self.batch_import, "#1565C0"),
+            ("🕐 自定义提醒", self.add_custom, "#6A1B9A"),
+            ("✏️ 修改", self.edit_task, "#333"),
+            ("📁 打开", self.open_selected_folder, "#333"),
+            ("✅ 打卡", self.toggle_done, "#2E7D32"),
+            ("🗑 删除", self.delete_task, "#C62828"),
+            ("🏷 管理标签", self.manage_tabs, "#E65100"),
+        ]
+        for txt, cb, color in btns:
+            btn = QPushButton(txt); btn.clicked.connect(cb)
+            btn.setMinimumHeight(32)
+            if color != "#333": btn.setStyleSheet(f"QPushButton {{ font-weight:bold; color:{color}; }}")
+            br.addWidget(btn)
+        br.addStretch(); ml.addLayout(br)
+        self.setCentralWidget(c)
+
+    def _rebuild_tabs(self):
+        """重建所有 Tab（标签变化时调用）"""
+        self.tab_bar.blockSignals(True)
+        self.tab_bar.clear()
+        self.tab_lists.clear()
+
+        custom_tabs = list(self.settings.data.get("custom_tabs", {}).keys())
+        self.tab_order = ["全部"] + BUILTIN_TABS + custom_tabs + ["自定义"]
+
+        for label in self.tab_order:
+            lst = QListWidget(); lst.setAlternatingRowColors(True)
             lst.setContextMenuPolicy(Qt.CustomContextMenu)
-            lst.customContextMenuRequested.connect(self.on_list_context_menu)
-            lst.itemDoubleClicked.connect(self.on_item_double_clicked)
+            lst.customContextMenuRequested.connect(self._on_context)
+            lst.itemDoubleClicked.connect(self._on_dblclick)
             self.tab_bar.addTab(lst, f"  {label}  ")
             self.tab_lists[label] = lst
 
-        self.tab_bar.currentChanged.connect(self.on_tab_changed)
-        main_layout.addWidget(self.tab_bar)
+        self.tab_bar.blockSignals(False)
 
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(6)
+    def _get_tab_type(self, tab_name):
+        """Tab 名称 → task type 字段值"""
+        if tab_name in BUILTIN_TABS:
+            return tab_name
+        if tab_name == "自定义":
+            return "自定义"
+        return tab_name  # custom tabs use their label directly
 
-        add_btn    = QPushButton("➕ 添加文件夹")
-        import_btn = QPushButton("📂 批量导入")
-        custom_btn = QPushButton("🕐 自定义提醒")
-        edit_btn   = QPushButton("✏️ 修改")
-        open_btn   = QPushButton("📁 打开")
-        done_btn   = QPushButton("✅ 打卡")
-        del_btn    = QPushButton("🗑 删除")
+    # ---- 刷新列表 ----
+    def _cur_list(self): return self.tab_lists.get(self._current_tab, self.tab_lists.get("全部"))
 
-        import_btn.setStyleSheet("QPushButton { font-weight: bold; color: #1565C0; }")
-        custom_btn.setStyleSheet("QPushButton { font-weight: bold; color: #6A1B9A; }")
-        done_btn.setStyleSheet("QPushButton { color: #2E7D32; }")
-        del_btn.setStyleSheet("QPushButton { color: #C62828; }")
-
-        add_btn.clicked.connect(self.add_task)
-        import_btn.clicked.connect(self.batch_import)
-        custom_btn.clicked.connect(self.add_custom_task)
-        edit_btn.clicked.connect(self.edit_task)
-        open_btn.clicked.connect(self.open_selected_folder)
-        done_btn.clicked.connect(self.toggle_done)
-        del_btn.clicked.connect(self.delete_task)
-
-        for btn in [add_btn, import_btn, custom_btn, edit_btn, open_btn, done_btn, del_btn]:
-            btn.setMinimumHeight(34)
-            btn_row.addWidget(btn)
-
-        btn_row.addStretch()
-        main_layout.addLayout(btn_row)
-
-        self.setCentralWidget(central)
-
-    # ---------- 列表刷新 ----------
-    def _current_list(self):
-        return self.tab_lists.get(self._current_tab, self.tab_lists["全部"])
-
-    def _filter_tasks(self, tab_name):
-        if tab_name == "全部":
-            return list(self.mgr.tasks)
-        reverse_map = {v: k for k, v in TYPE_TO_TAB.items()}
-        target_type = reverse_map.get(tab_name, "")
-        return [t for t in self.mgr.tasks if t.get("type") == target_type]
+    def _filter(self, tab_name):
+        if tab_name == "全部": return list(self.mgr.tasks)
+        target = self._get_tab_type(tab_name)
+        if tab_name == "间隔":
+            return [t for t in self.mgr.tasks if t.get("type") == "间隔" and not t.get("is_custom_reminder")]
+        if tab_name == "自定义":
+            return [t for t in self.mgr.tasks if t.get("is_custom_reminder")]
+        return [t for t in self.mgr.tasks if t.get("type") == target and not t.get("is_custom_reminder")]
 
     def refresh_all_tabs(self):
-        today_str = QDate.currentDate().toString("yyyy-MM-dd")
+        today = QDate.currentDate().toString("yyyy-MM-dd")
+        # 确保 tab 存在
+        if self._current_tab not in self.tab_lists:
+            self._current_tab = "全部"
 
         for tab_name, lst in self.tab_lists.items():
             lst.clear()
-            tasks = self._filter_tasks(tab_name)
-
+            tasks = self._filter(tab_name)
             for t in tasks:
-                is_done = (t.get("last_done") == today_str)
-                path_ok = t.get("is_custom") or os.path.exists(t.get("path", ""))
-
+                is_done = (t.get("last_done") == today)
+                path_ok = t.get("is_custom_reminder") or os.path.exists(t.get("path",""))
                 prefix = "✅ " if is_done else "⬜ "
                 text = f"{prefix}{t['name']}"
-
-                item = QListWidgetItem(text)
-                item.setData(Qt.UserRole, t)
-
-                if is_done:
-                    item.setForeground(Qt.gray)
-                elif not path_ok:
-                    item.setForeground(Qt.red)
-                    item.setText(f"❌ {t['name']}（失效）")
-
-                # 闹钟关闭标记
-                if not t.get("alarm_enabled", True) and not is_done:
-                    item.setText(f"🔕 {t['name']}")
-
+                item = QListWidgetItem(text); item.setData(Qt.UserRole, t)
+                if is_done: item.setForeground(Qt.gray)
+                elif not path_ok: item.setForeground(Qt.red); item.setText(f"❌ {t['name']}（失效）")
+                if not t.get("alarm_enabled", True) and not is_done: item.setText(f"🔕 {t['name']}")
                 lst.addItem(item)
-
-            count = len(tasks)
-            self.tab_bar.setTabText(
-                TAB_ORDER.index(tab_name),
-                f"  {tab_name}（{count}）" if count else f"  {tab_name}  "
-            )
+            cnt = len(tasks)
+            idx = self.tab_order.index(tab_name) if tab_name in self.tab_order else 0
+            self.tab_bar.setTabText(idx, f"  {tab_name}（{cnt}）" if cnt else f"  {tab_name}  ")
 
         if self._current_tab in self.tab_lists:
-            idx = TAB_ORDER.index(self._current_tab)
+            idx = self.tab_order.index(self._current_tab) if self._current_tab in self.tab_order else 0
             self.tab_bar.setCurrentIndex(idx)
 
-    def on_tab_changed(self, index):
-        self._current_tab = TAB_ORDER[index]
+    def on_tab_changed(self, idx):
+        if idx < len(self.tab_order):
+            self._current_tab = self.tab_order[idx]
 
-    # ---------- 右键菜单 ----------
-    def on_list_context_menu(self, pos):
-        lst = self._current_list()
-        item = lst.itemAt(pos)
-        if not item:
-            return
+    # ---- 右键 ----
+    def _on_context(self, pos):
+        lst = self._cur_list(); item = lst.itemAt(pos)
+        if not item: return
         lst.setCurrentItem(item)
         task = item.data(Qt.UserRole)
-
         menu = QMenu(self)
-        if task.get("is_custom"):
+        if task.get("is_custom_reminder"):
             menu.addAction("✏️ 修改", self.edit_task)
-            menu.addAction("✅ 打卡/取消打卡", self.toggle_done)
+            menu.addAction("✅ 打卡", self.toggle_done)
             menu.addAction("🗑 删除", self.delete_task)
         else:
             menu.addAction("📁 打开文件夹", self.open_selected_folder)
-            menu.addAction("✅ 打卡/取消打卡", self.toggle_done)
-            if task.get("alarm_enabled", False):
-                menu.addAction("🔕 关闭闹钟", self.toggle_alarm)
-            else:
-                menu.addAction("🔔 开启闹钟", self.toggle_alarm)
-            menu.addAction("✏️ 修改设置", self.edit_task)
+            menu.addAction("✅ 打卡", self.toggle_done)
+            menu.addAction("🔔 切换闹钟", self.toggle_alarm)
+            menu.addAction("✏️ 修改", self.edit_task)
             menu.addSeparator()
-            menu.addAction("🗑 删除任务", self.delete_task)
+            menu.addAction("🗑 删除", self.delete_task)
         menu.exec(lst.viewport().mapToGlobal(pos))
 
-    def on_item_double_clicked(self, item):
-        task = item.data(Qt.UserRole)
-        if task and not task.get("is_custom"):
-            self.open_folder(task.get("path", ""))
+    def _on_dblclick(self, item):
+        t = item.data(Qt.UserRole)
+        if t and not t.get("is_custom_reminder"):
+            self.open_folder(t.get("path",""))
 
-    # ---------- 选中任务 ----------
-    def _selected_task(self):
-        lst = self._current_list()
-        item = lst.currentItem()
+    def _sel_task(self):
+        item = self._cur_list().currentItem()
         return item.data(Qt.UserRole) if item else None
 
-    def _selected_index_in_mgr(self):
-        task = self._selected_task()
-        if task:
-            try:
-                return self.mgr.tasks.index(task)
-            except ValueError:
-                pass
+    def _sel_idx(self):
+        t = self._sel_task()
+        if t:
+            try: return self.mgr.tasks.index(t)
+            except ValueError: pass
         return -1
 
-    # ---------- 操作 ----------
+    # ---- 操作 ----
     def add_task(self):
-        dlg = TaskDialog(self)
+        dlg = TaskDialog(self, tab_labels=list(self.settings.data.get("custom_tabs", {}).keys()))
         if dlg.exec():
-            data = dlg.get_data()
-            if data["name"] and data["path"]:
-                self.mgr.tasks.append(data)
-                self.mgr.save_tasks()
-                self.refresh_all_tabs()
+            d = dlg.get_data()
+            if d["name"] and d["path"]:
+                self.mgr.tasks.append(d); self.mgr.save(); self.refresh_all_tabs()
 
-    def add_custom_task(self):
-        dlg = CustomTaskDialog(self)
+    def add_custom(self):
+        dlg = CustomReminderDialog(self)
         if dlg.exec():
-            data = dlg.get_data()
-            if data["name"]:
-                self.mgr.tasks.append(data)
-                self.mgr.save_tasks()
-                self.refresh_all_tabs()
+            d = dlg.get_data()
+            if d["name"]:
+                self.mgr.tasks.append(d); self.mgr.save(); self.refresh_all_tabs()
 
     def edit_task(self):
-        row = self._selected_index_in_mgr()
-        if row < 0:
-            QMessageBox.information(self, "提示", "请先选中一个任务。")
-            return
-        task = self.mgr.tasks[row]
-        if task.get("is_custom"):
-            dlg = CustomTaskDialog(self, task)
+        idx = self._sel_idx()
+        if idx < 0: QMessageBox.information(self,"提示","请先选中一个任务"); return
+        t = self.mgr.tasks[idx]
+        if t.get("is_custom_reminder"):
+            dlg = CustomReminderDialog(self, t)
         else:
-            dlg = TaskDialog(self, task)
+            dlg = TaskDialog(self, t, list(self.settings.data.get("custom_tabs", {}).keys()), t.get("type","每日"))
         if dlg.exec():
-            self.mgr.tasks[row] = dlg.get_data()
-            self.mgr.save_tasks()
-            self.refresh_all_tabs()
+            self.mgr.tasks[idx] = dlg.get_data(); self.mgr.save(); self.refresh_all_tabs()
 
     def delete_task(self):
-        row = self._selected_index_in_mgr()
-        if row < 0:
-            return
-        task = self.mgr.tasks[row]
-        reply = QMessageBox.question(
-            self, "确认删除",
-            f"确定删除「{task['name']}」吗？",
-            QMessageBox.Yes | QMessageBox.No
-        )
-        if reply == QMessageBox.Yes:
-            self.mgr.tasks.pop(row)
-            self.mgr.save_tasks()
-            self.refresh_all_tabs()
+        idx = self._sel_idx()
+        if idx < 0: return
+        t = self.mgr.tasks[idx]
+        if QMessageBox.Yes == QMessageBox.question(self,"确认",f"删除「{t['name']}」？"):
+            self.mgr.tasks.pop(idx); self.mgr.save(); self.refresh_all_tabs()
 
     def open_selected_folder(self):
-        task = self._selected_task()
-        if task and not task.get("is_custom"):
-            self.open_folder(task.get("path", ""))
+        t = self._sel_task()
+        if t and not t.get("is_custom_reminder"):
+            self.open_folder(t.get("path",""))
 
-    def open_folder(self, path):
-        if path and os.path.exists(path):
-            os.startfile(path)
-        else:
-            QMessageBox.warning(self, "错误", f"文件夹路径不存在：\n{path}")
+    def open_folder(self, p):
+        if p and os.path.exists(p): os.startfile(p)
+        else: QMessageBox.warning(self,"错误",f"路径不存在:\n{p}")
 
     def toggle_done(self):
-        row = self._selected_index_in_mgr()
-        if row < 0:
-            QMessageBox.information(self, "提示", "请先选中一个任务。")
-            return
-        today_str = QDate.currentDate().toString("yyyy-MM-dd")
-        current = self.mgr.tasks[row].get("last_done")
-        self.mgr.tasks[row]["last_done"] = "" if current == today_str else today_str
-        self.mgr.save_tasks()
-        self.refresh_all_tabs()
+        idx = self._sel_idx()
+        if idx < 0: QMessageBox.information(self,"提示","请先选中一个任务"); return
+        today = QDate.currentDate().toString("yyyy-MM-dd")
+        cur = self.mgr.tasks[idx].get("last_done")
+        self.mgr.tasks[idx]["last_done"] = "" if cur == today else today
+        self.mgr.save(); self.refresh_all_tabs()
 
     def toggle_alarm(self):
-        task = self._selected_task()
-        if task:
-            task["alarm_enabled"] = not task.get("alarm_enabled", False)
-            self.mgr.save_tasks()
+        t = self._sel_task()
+        if t:
+            t["alarm_enabled"] = not t.get("alarm_enabled", False)
+            self.mgr.save(); self.refresh_all_tabs()
+
+    # ---- 管理自定义标签 ----
+    def manage_tabs(self):
+        """管理自定义标签：添加/删除/编辑关键词"""
+        dlg = ManageTabsDialog(self, self.settings)
+        if dlg.exec():
+            self.settings.save()
+            self._rebuild_tabs()
+            self._current_tab = "全部"
             self.refresh_all_tabs()
 
-    # ---------- 批量导入 ----------
+    # ---- 批量导入 ----
     def batch_import(self):
-        parent_dir = QFileDialog.getExistingDirectory(self, "选择包含办公文件夹的父目录")
-        if not parent_dir:
-            return
+        parent = QFileDialog.getExistingDirectory(self, "选择父目录")
+        if not parent: return
+        try: entries = os.listdir(parent)
+        except OSError as e: QMessageBox.warning(self,"错误",str(e)); return
 
-        try:
-            entries = os.listdir(parent_dir)
-        except OSError as e:
-            QMessageBox.warning(self, "错误", f"无法读取目录：\n{e}")
-            return
+        subdirs = [d for d in entries if os.path.isdir(os.path.join(parent,d))]
+        if not subdirs: QMessageBox.information(self,"提示","无子文件夹"); return
 
-        subdirs = [d for d in entries if os.path.isdir(os.path.join(parent_dir, d))]
-        if not subdirs:
-            QMessageBox.information(self, "提示", "所选目录下没有子文件夹。")
-            return
-
-        imported = []
-        skipped = []
+        rules = self.settings.get_all_rules()
+        imported, skipped = [], []
         for d in sorted(subdirs):
-            full_path = os.path.join(parent_dir, d)
-            task_type = classify_folder_name(d)
-            remind_day = extract_day_from_name(d)
-
-            if any(t.get("path") == full_path for t in self.mgr.tasks):
-                skipped.append(d)
-                continue
-
-            task = {
-                "name": d,
-                "path": full_path,
-                "type": task_type,
-                "remind_time": "09:00",
-                "remind_day": remind_day,
-                "interval": 60,
-                "alarm_enabled": False,   # 默认关闭闹钟
-                "last_done": "",
-                "last_reminded": "",
-                "is_custom": False,
-            }
+            fp = os.path.join(parent, d)
+            if any(t.get("path")==fp for t in self.mgr.tasks): skipped.append(d); continue
+            label = classify_folder_name(d, rules)
+            day = extract_day_from_name(d)
+            task = {"name":d,"path":fp,"type":label,"remind_time":"09:00","remind_day":day,
+                    "interval":30,"alarm_enabled":False,"last_done":"","last_reminded":"",
+                    "is_custom_reminder":False}
             self.mgr.tasks.append(task)
-            imported.append(f"  📁 {d}  →  {task_type}"
-                            + (f"（{remind_day}号）🔕" if task_type == "每月固定日任务" else " 🔕"))
+            imported.append(f"  📁 {d} → {label}")
 
-        # 将父目录加入监控
-        if parent_dir not in self.settings.data.get("watch_dirs", []):
-            self.settings.data.setdefault("watch_dirs", []).append(parent_dir)
-            self.settings.save()
-            self.sync_timer.start(300000)
+        if parent not in self.settings.data.get("watch_dirs",[]):
+            self.settings.data.setdefault("watch_dirs",[]).append(parent)
+            self.settings.save(); self.sync_timer.start(300000)
 
-        self.mgr.save_tasks()
-        self.refresh_all_tabs()
-
-        msg = f"导入完成！\n\n✅ 成功导入 {len(imported)} 个文件夹（闹钟默认关闭 🔕）\n"
-        if imported:
-            msg += "\n".join(imported[:15])
-            if len(imported) > 15:
-                msg += f"\n  ... 还有 {len(imported) - 15} 个"
-        if skipped:
-            msg += f"\n\n⏭ 跳过 {len(skipped)} 个（已存在）"
-        msg += "\n\n💡 右键任务可开启闹钟 | 程序每5分钟自动同步文件夹变化"
-        QMessageBox.information(self, "批量导入结果", msg)
+        self.mgr.save(); self.refresh_all_tabs()
+        msg = f"导入完成！\n\n✅ {len(imported)} 个（🔕 闹钟默认关闭）\n"
+        if imported: msg += "\n".join(imported[:15])
+        if len(imported)>15: msg += f"\n  ...还有 {len(imported)-15} 个"
+        if skipped: msg += f"\n\n⏭ 跳过 {len(skipped)} 个（已存在）"
+        msg += "\n\n💡 右键开启闹钟 | 自动同步每5分钟"
+        QMessageBox.information(self,"导入结果",msg)
 
     def auto_sync_folders(self):
-        """自动同步：扫描监控目录，新增文件夹自动加入，删除的文件夹自动移除"""
-        watch_dirs = self.settings.data.get("watch_dirs", [])
-        for parent_dir in watch_dirs:
-            if not os.path.exists(parent_dir):
-                continue
-            try:
-                entries = os.listdir(parent_dir)
-            except OSError:
-                continue
+        for parent in self.settings.data.get("watch_dirs",[]):
+            if not os.path.exists(parent): continue
+            try: entries = os.listdir(parent)
+            except: continue
+            cur = {os.path.join(parent,d) for d in entries if os.path.isdir(os.path.join(parent,d))}
+            existing = {t["path"] for t in self.mgr.tasks if t.get("path") and not t.get("is_custom_reminder")}
+            managed = {p for p in existing if p.startswith(parent+os.sep)}
 
-            current_subdirs = set()
-            for d in entries:
-                full_path = os.path.join(parent_dir, d)
-                if os.path.isdir(full_path):
-                    current_subdirs.add(full_path)
-
-            # 现有路径
-            existing_paths = {t["path"] for t in self.mgr.tasks if t.get("path") and not t.get("is_custom")}
-            # 属于此父目录的路径
-            managed_paths = {p for p in existing_paths if p.startswith(parent_dir + os.sep)}
-
+            rules = self.settings.get_all_rules()
             added = []
-            removed = []
-            for new_path in (current_subdirs - managed_paths):
-                d = os.path.basename(new_path)
-                task_type = classify_folder_name(d)
-                remind_day = extract_day_from_name(d)
-                task = {
-                    "name": d, "path": new_path, "type": task_type,
-                    "remind_time": "09:00", "remind_day": remind_day,
-                    "interval": 60, "alarm_enabled": False,
-                    "last_done": "", "last_reminded": "", "is_custom": False,
-                }
-                self.mgr.tasks.append(task)
-                added.append(d)
+            for np in (cur - managed):
+                dn = os.path.basename(np)
+                label = classify_folder_name(dn, rules)
+                day = extract_day_from_name(dn)
+                task = {"name":dn,"path":np,"type":label,"remind_time":"09:00","remind_day":day,
+                        "interval":30,"alarm_enabled":False,"last_done":"","last_reminded":"",
+                        "is_custom_reminder":False}
+                self.mgr.tasks.append(task); added.append(dn)
 
-            for old_path in (managed_paths - current_subdirs):
-                d = os.path.basename(old_path)
-                self.mgr.remove_by_path(old_path)
-                removed.append(d)
+            removed = []
+            for op in (managed - cur):
+                self.mgr.remove_by_path(op); removed.append(os.path.basename(op))
 
             if added or removed:
-                self.mgr.save_tasks()
-                self.refresh_all_tabs()
-                if added:
-                    self.tray_icon.showMessage("文件夹同步", f"新增 {len(added)} 个文件夹（闹钟已关闭）", QSystemTrayIcon.Information, 3000)
-                if removed:
-                    self.tray_icon.showMessage("文件夹同步", f"移除 {len(removed)} 个已删除的文件夹", QSystemTrayIcon.Information, 3000)
+                self.mgr.save(); self.refresh_all_tabs()
+                if added: self.tray_icon.showMessage("同步","新增 {} 个文件夹（🔕）".format(len(added)), QSystemTrayIcon.Information, 3000)
+                if removed: self.tray_icon.showMessage("同步","移除 {} 个文件夹".format(len(removed)), QSystemTrayIcon.Information, 3000)
 
-    # ---------- 系统托盘 ----------
+    # ---- 托盘 ----
     def init_tray(self):
         self.tray_icon = QSystemTrayIcon(self)
-        icon = self.style().standardIcon(QStyle.SP_DirIcon)
-        self.tray_icon.setIcon(icon)
-
-        tray_menu = QMenu()
-        show_action = QAction("显示主界面", self)
-        show_action.triggered.connect(self.show_and_activate)
-        quit_action = QAction("退出程序", self)
-        quit_action.triggered.connect(self.app.quit)
-
-        tray_menu.addAction(show_action)
-        tray_menu.addSeparator()
-        tray_menu.addAction(quit_action)
-        self.tray_icon.setContextMenu(tray_menu)
-        self.tray_icon.activated.connect(self.on_tray_activated)
+        self.tray_icon.setIcon(self._make_icon())
+        m = QMenu()
+        a1 = QAction("显示", self); a1.triggered.connect(self.show_and_activate); m.addAction(a1)
+        m.addSeparator()
+        a2 = QAction("退出", self); a2.triggered.connect(self.app.quit); m.addAction(a2)
+        self.tray_icon.setContextMenu(m)
+        self.tray_icon.activated.connect(lambda r: self.show_and_activate() if r==QSystemTrayIcon.Trigger else None)
         self.tray_icon.show()
 
+    def _make_icon(self):
+        """生成一个现代风格的方形图标（蓝紫渐变 + 白色文件夹）"""
+        px = QPixmap(64,64); px.fill(Qt.transparent)
+        p = QPainter(px); p.setRenderHint(QPainter.Antialiasing)
+        # 圆角矩形背景
+        p.setBrush(QBrush(QColor(59,130,246))); p.setPen(Qt.NoPen)
+        p.drawRoundedRect(2,2,60,60,14,14)
+        # 白色文件夹简笔
+        p.setBrush(QBrush(QColor(255,255,255,220))); p.setPen(Qt.NoPen)
+        p.drawRoundedRect(10,14,28,6,3,3)   # tab
+        p.drawRoundedRect(10,20,44,32,6,6)   # body
+        p.end()
+        return QIcon(px)
+
     def show_and_activate(self):
-        self.show()
-        self.activateWindow()
-        self.raise_()
+        self.show(); self.activateWindow(); self.raise_()
 
-    def on_tray_activated(self, reason):
-        if reason == QSystemTrayIcon.Trigger:
-            if self.isVisible():
-                self.hide()
-            else:
-                self.show_and_activate()
+    def closeEvent(self, e):
+        e.ignore(); self.hide()
+        self.tray_icon.showMessage("办公助手","已最小化到托盘，后台运行中", QSystemTrayIcon.Information, 2000)
 
-    def closeEvent(self, event):
-        event.ignore()
-        self.hide()
-        self.tray_icon.showMessage(
-            "办公助手",
-            "程序已最小化到系统托盘，后台持续运行。",
-            QSystemTrayIcon.Information,
-            2000
-        )
-
-    # ---------- 提醒引擎 ----------
+    # ---- 提醒 ----
     def check_reminders(self):
-        now = datetime.now()
-        today_str = now.strftime("%Y-%m-%d")
-        current_time_str = now.strftime("%H:%M")
-        current_day = now.day
-        current_weekday = now.weekday()  # 0=周一
+        now = datetime.now(); today = now.strftime("%Y-%m-%d"); ct = now.strftime("%H:%M")
+        cd = now.day; cw = now.weekday()
 
         for t in self.mgr.tasks:
-            if t.get("last_done") == today_str:
-                continue
-            if not t.get("alarm_enabled", True):
-                continue
+            if t.get("last_done") == today: continue
+            if not t.get("alarm_enabled", True): continue
+            key = f"{today}_{ct}"; remind = False
 
-            should_remind = False
-            key = f"{today_str}_{current_time_str}"
+            if t.get("is_custom_reminder"):
+                remind = self._check_custom(t, now, today, ct, cd, cw, key)
+            else:
+                tp = t.get("type","每日")
+                if tp in ("每日",) and t.get("remind_time")==ct and t.get("last_reminded")!=key:
+                    remind=True
+                elif tp in ("每周",) and cw==0 and t.get("remind_time")==ct and t.get("last_reminded")!=key:
+                    remind=True
+                elif tp in ("每月",) and cd==t.get("remind_day",1) and t.get("remind_time")==ct and t.get("last_reminded")!=key:
+                    remind=True
+                elif tp in ("间隔",):
+                    last=t.get("last_interval_check")
+                    if not last: t["last_interval_check"]=now.timestamp()
+                    elif (now.timestamp()-float(last))>=t.get("interval",30)*60:
+                        remind=True; t["last_interval_check"]=now.timestamp()
+            if remind:
+                t["last_reminded"]=key; self.mgr.save(); self._alert(t)
 
-            if t.get("is_custom"):
-                should_remind = self._check_custom_reminder(t, now, today_str, current_time_str, current_day, current_weekday, key)
-            elif t["type"] == "每日任务":
-                if t["remind_time"] == current_time_str and t.get("last_reminded") != key:
-                    should_remind = True
-            elif t["type"] == "每周任务":
-                if current_weekday == 0 and t["remind_time"] == current_time_str and t.get("last_reminded") != key:
-                    should_remind = True
-            elif t["type"] == "每月固定日任务":
-                if current_day == t["remind_day"] and t["remind_time"] == current_time_str and t.get("last_reminded") != key:
-                    should_remind = True
-            elif t["type"] == "间隔时间提醒":
-                last = t.get("last_interval_check")
-                if not last:
-                    t["last_interval_check"] = now.timestamp()
-                elif (now.timestamp() - float(last)) >= (t["interval"] * 60):
-                    should_remind = True
-                    t["last_interval_check"] = now.timestamp()
-
-            if should_remind:
-                t["last_reminded"] = key
-                self.mgr.save_tasks()
-                self.trigger_alert(t)
-
-    def _check_custom_reminder(self, t, now, today_str, current_time, current_day, current_weekday, key):
-        freq = t.get("custom_freq", "仅一次")
-        remind_time = t.get("remind_time", "09:00")
-        if remind_time != current_time:
-            return False
-        if t.get("last_reminded") == key:
-            return False
-
-        if freq == "仅一次":
-            custom_date = t.get("custom_date", "")
-            return custom_date == today_str
-        elif freq == "每天":
-            return True
-        elif freq == "每周":
-            initial_date = t.get("custom_date", "")
-            if initial_date:
-                try:
-                    init_dt = datetime.strptime(initial_date, "%Y-%m-%d")
-                    return current_weekday == init_dt.weekday()
-                except ValueError:
-                    pass
-            return current_weekday == 0  # 默认周一
-        elif freq == "每月":
-            initial_day = t.get("remind_day", 1)
-            return current_day == initial_day
-        elif freq == "每年":
-            initial_date = t.get("custom_date", "")
-            if initial_date:
-                try:
-                    init_dt = datetime.strptime(initial_date, "%Y-%m-%d")
-                    return current_day == init_dt.day and now.month == init_dt.month
-                except ValueError:
-                    pass
+    def _check_custom(self, t, now, today, ct, cd, cw, key):
+        freq = t.get("custom_freq","仅一次")
+        rt = t.get("remind_time","09:00")
+        if rt != ct: return False
+        if t.get("last_reminded")==key: return False
+        if freq=="仅一次": return t.get("custom_date","")==today
+        if freq=="每天": return True
+        if freq=="每周":
+            try:
+                init=datetime.strptime(t.get("custom_date",today),"%Y-%m-%d")
+                return cw==init.weekday()
+            except: return cw==0
+        if freq=="每月": return cd==t.get("remind_day",1)
+        if freq=="每年":
+            try:
+                init=datetime.strptime(t.get("custom_date",today),"%Y-%m-%d")
+                return cd==init.day and now.month==init.month
+            except: return False
+        if freq=="间隔":
+            last=t.get("last_interval_check")
+            if not last: t["last_interval_check"]=now.timestamp(); return False
+            if (now.timestamp()-float(last))>=t.get("interval",30)*60:
+                t["last_interval_check"]=now.timestamp(); return True
             return False
         return False
 
-    def trigger_alert(self, task):
+    def _alert(self, t):
         QApplication.beep()
-        title = f"提醒: {task['name']}"
-        if task.get("note"):
-            msg = f"{task.get('note')}"
-        elif task.get("is_custom"):
-            msg = f"自定义提醒"
-        else:
-            msg = f"分类：{task['type']}"
+        title = f"提醒: {t['name']}"
+        msg = t.get("note","") or (f"分类：{t.get('type','')}")
         self.tray_icon.showMessage(title, msg, QSystemTrayIcon.Information, 15000)
 
 
-# ==================== 入口 ====================
+# ============== ManageTabsDialog ==============
+class ManageTabsDialog(QDialog):
+    def __init__(self, parent, settings):
+        super().__init__(parent)
+        self.setWindowTitle("管理自定义标签")
+        self.resize(480, 400)
+        self.settings = settings
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("<b>自定义标签</b> — 按关键词自动归类文件夹"))
+        layout.addWidget(QLabel("内置标签（每日/每周/每月/间隔）不可删除"))
+
+        self.list_widget = QListWidget()
+        self._refresh_list()
+        layout.addWidget(self.list_widget)
+
+        bl = QHBoxLayout()
+        add_btn = QPushButton("➕ 新建标签"); add_btn.clicked.connect(self._add)
+        edit_btn = QPushButton("✏️ 编辑关键词"); edit_btn.clicked.connect(self._edit)
+        del_btn = QPushButton("🗑 删除标签"); del_btn.clicked.connect(self._delete)
+        bl.addWidget(add_btn); bl.addWidget(edit_btn); bl.addWidget(del_btn)
+        layout.addLayout(bl)
+
+        bl2 = QHBoxLayout(); bl2.addStretch()
+        ok = QPushButton("完成"); ok.clicked.connect(self.accept); bl2.addWidget(ok)
+        layout.addLayout(bl2)
+
+    def _refresh_list(self):
+        self.list_widget.clear()
+        customs = self.settings.data.get("custom_tabs", {})
+        self.list_widget.addItem("📌 每日 — 关键词: 每天, 每日, 日报, daily, every...")
+        self.list_widget.addItem("📌 每周 — 关键词: 每周, 周报, weekly, week")
+        self.list_widget.addItem("📌 每月 — 关键词: 每月, 月度, 月报, monthly, month")
+        self.list_widget.addItem("📌 间隔 — 手动指定（不自动匹配关键词）")
+        for label, keywords in customs.items():
+            self.list_widget.addItem(f"🏷 {label} — 关键词: {', '.join(keywords)}")
+
+    def _add(self):
+        name, ok = QInputDialog.getText(self, "新建标签", "标签名称（如：每季度、每小时）：")
+        if not ok or not name.strip(): return
+        name = name.strip()
+        if name in BUILTIN_TABS or name in ("全部","自定义"):
+            QMessageBox.warning(self,"错误","标签名与内置标签冲突"); return
+        if name in self.settings.data.get("custom_tabs", {}):
+            QMessageBox.warning(self,"错误","标签已存在"); return
+
+        kw, ok2 = QInputDialog.getText(self, "设置关键词", f"「{name}」的匹配关键词（逗号分隔）：\n如：季度, quarterly, Q")
+        if not ok2: return
+        keywords = [k.strip() for k in kw.split(",") if k.strip()]
+        if not keywords:
+            QMessageBox.warning(self,"错误","至少需要一个关键词"); return
+
+        self.settings.data.setdefault("custom_tabs",{})[name] = keywords
+        self.settings.save()
+        self._refresh_list()
+
+    def _edit(self):
+        row = self.list_widget.currentRow()
+        if row < 0: return
+        customs = self.settings.data.get("custom_tabs",{})
+        labels = list(customs.keys())
+        if row < 4 or row-4 >= len(labels):
+            QMessageBox.information(self,"提示","内置标签不可编辑"); return
+        label = labels[row-4]
+        cur_kw = customs[label]
+        kw, ok = QInputDialog.getText(self, "编辑关键词", f"「{label}」的关键词（逗号分隔）：", text=", ".join(cur_kw))
+        if ok:
+            keywords = [k.strip() for k in kw.split(",") if k.strip()]
+            if keywords:
+                customs[label] = keywords; self.settings.save(); self._refresh_list()
+
+    def _delete(self):
+        row = self.list_widget.currentRow()
+        if row < 0: return
+        customs = self.settings.data.get("custom_tabs",{})
+        labels = list(customs.keys())
+        if row < 4 or row-4 >= len(labels):
+            QMessageBox.information(self,"提示","内置标签不可删除"); return
+        label = labels[row-4]
+        if QMessageBox.Yes == QMessageBox.question(self,"确认",f"删除标签「{label}」？\n已有任务不会被删除"):
+            del customs[label]; self.settings.save(); self._refresh_list()
+
+
+# ============== 入口 ==============
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
-    # ---- 单实例锁 ----
+    # 单实例锁
     server = QLocalServer()
-    socket = QLocalSocket()
-    socket.connectToServer(APP_KEY)
-    if socket.waitForConnected(500):
-        # 已有实例在运行，通知它显示窗口
-        socket.write(b"show")
-        socket.flush()
-        socket.waitForBytesWritten(500)
-        socket.close()
+    sock = QLocalSocket(); sock.connectToServer(APP_KEY)
+    if sock.waitForConnected(500):
+        sock.write(b"show"); sock.flush(); sock.waitForBytesWritten(500); sock.close()
         sys.exit(0)
+    sock.close(); server.listen(APP_KEY)
 
-    socket.close()
-    server.listen(APP_KEY)
+    window = MainWindow(app); window.show()
 
-    window = MainWindow(app)
-    window.show()
-
-    # 监听其他进程的激活请求
-    def handle_new_connection():
+    def _on_conn():
         conn = server.nextPendingConnection()
         if conn:
             conn.waitForReadyRead(500)
-            data = bytes(conn.readAll())
-            if b"show" in data:
-                window.show_and_activate()
+            if b"show" in bytes(conn.readAll()): window.show_and_activate()
             conn.close()
-
-    server.newConnection.connect(handle_new_connection)
+    server.newConnection.connect(_on_conn)
 
     sys.exit(app.exec())
