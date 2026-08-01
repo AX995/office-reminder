@@ -1,39 +1,33 @@
-import sys, os, json, re
+import sys,os,json,re
 from datetime import datetime
-from PySide6.QtCore import Qt, QTimer, QTime, QDate
-from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QListWidget, QListWidgetItem, QPushButton, QLabel, QFileDialog, QComboBox, QTimeEdit,
-    QSpinBox, QSystemTrayIcon, QMenu, QMessageBox, QDialog, QFormLayout, QLineEdit,
-    QTabWidget, QStyle, QCheckBox, QDateEdit, QTextEdit, QGroupBox, QInputDialog, QTabBar)
-from PySide6.QtGui import QIcon, QAction, QPainter, QPixmap, QColor, QBrush
-from PySide6.QtNetwork import QLocalServer, QLocalSocket
-import calendar
+from PySide6.QtCore import Qt,QTimer,QTime,QDate
+from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,
+    QListWidget,QListWidgetItem,QPushButton,QLabel,QFileDialog,QComboBox,QTimeEdit,
+    QSpinBox,QSystemTrayIcon,QMenu,QMessageBox,QDialog,QFormLayout,QLineEdit,
+    QTabWidget,QStyle,QCheckBox,QDateEdit,QTextEdit,QGroupBox,QInputDialog,QTabBar,QFrame)
+from PySide6.QtGui import QIcon,QAction,QPainter,QPixmap,QColor,QBrush,QFont
+from PySide6.QtNetwork import QLocalServer,QLocalSocket
 
-DATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "OfficeReminder")
-os.makedirs(DATA_DIR, exist_ok=True)
-CFG = os.path.join(DATA_DIR, "tasks.json")
-SET = os.path.join(DATA_DIR, "settings.json")
-AK = "OfficeReminder_v4"
+DATA_DIR=os.path.join(os.environ.get("APPDATA",os.path.expanduser("~")),"OfficeReminder")
+os.makedirs(DATA_DIR,exist_ok=True)
+CFG=os.path.join(DATA_DIR,"tasks.json")
+SET=os.path.join(DATA_DIR,"settings.json")
+AK="OR_v6"
 
-BUILTIN_TABS = ["每日","每周","每月","间隔"]
-BUILTIN_RULES = {"每日":[r"每天",r"每日",r"日报",r"daily",r"每\s*天",r"每\s*日",r"每(?![周月])",r"every"],
+BUILTIN_TABS=["每日","每周","每月","间隔"]
+BUILTIN_RULES={"每日":[r"每天",r"每日",r"日报",r"daily",r"每\s*天",r"每\s*日",r"每(?![周月])",r"every"],
     "每周":[r"每周",r"周报",r"weekly",r"week"],"每月":[r"每月",r"月度",r"月报",r"monthly",r"month"],"间隔":[]}
 
-def extract_day(dirname):
-    m=re.search(r"(\d+)\s*(?:号|日|th|st|nd|rd)?",dirname,re.IGNORECASE)
+def extract_day(dn):
+    m=re.search(r"(\d+)\s*(?:号|日|th|st|nd|rd)?",dn,re.IGNORECASE)
     if m: return max(1,min(31,int(m.group(1))))
-    cn={"一":1,"二":2,"三":3,"四":4,"五":5,"六":6,"七":7,"八":8,"九":9,"十":10,
-        "十一":11,"十二":12,"十三":13,"十四":14,"十五":15,"十六":16,"十七":17,
-        "十八":18,"十九":19,"二十":20,"二十一":21,"二十二":22,"二十三":23,
-        "二十四":24,"二十五":25,"二十六":26,"二十七":27,"二十八":28,"二十九":29,"三十":30,"三十一":31}
+    cn={"一":1,"二":2,"三":3,"四":4,"五":5,"六":6,"七":7,"八":8,"九":9,"十":10,"十一":11,"十二":12,"十三":13,"十四":14,"十五":15,"十六":16,"十七":17,"十八":18,"十九":19,"二十":20,"二十一":21,"二十二":22,"二十三":23,"二十四":24,"二十五":25,"二十六":26,"二十七":27,"二十八":28,"二十九":29,"三十":30,"三十一":31}
     for w,n in sorted(cn.items(),key=lambda x:-len(x[0])):
-        if w in dirname: return n
+        if w in dn: return n
     return 1
 
 class Settings:
-    def __init__(s):
-        s.data={"watch_dirs":[],"custom_tabs":{},"tab_order":[]}
-        s.load()
+    def __init__(s): s.data={"watch_dirs":[],"custom_tabs":{},"tab_order":[]}; s.load()
     def load(s):
         if os.path.exists(SET):
             try:
@@ -58,16 +52,14 @@ class Settings:
             if t not in o: o.append(t)
         return o
 
-def classify(name, rules):
-    for l in rules:
-        for p in rules[l]:
-            if re.search(p,name,re.IGNORECASE): return l
+def classify(name,rules):
+    for l,p in rules.items():
+        for pat in p:
+            if re.search(pat,name,re.IGNORECASE): return l
     return "每日"
 
 class TaskMgr:
-    def __init__(s):
-        s.tasks=[]
-        s.load()
+    def __init__(s): s.tasks=[]; s.load()
     def load(s):
         if os.path.exists(CFG):
             try:
@@ -76,12 +68,10 @@ class TaskMgr:
         else: s.tasks=[]
     def save(s):
         with open(CFG,"w",encoding="utf-8") as f: json.dump(s.tasks,f,ensure_ascii=False,indent=2)
-    def rm_by_path(s,p):
-        s.tasks=[t for t in s.tasks if t.get("path")!=p]
+    def rm_by_path(s,p): s.tasks=[t for t in s.tasks if t.get("path")!=p]
 
 class DraggableTabBar(QTabBar):
-    def __init__(s,p=None):
-        super().__init__(p); s.setMovable(True)
+    def __init__(s,p=None): super().__init__(p); s.setMovable(True)
 
 class TaskDialog(QDialog):
     def __init__(s,p=None,d=None,labels=None,tt=None):
@@ -158,11 +148,11 @@ class MainWindow(QMainWindow):
     def __init__(s,app):
         super().__init__()
         s.app=app; s.mgr=TaskMgr(); s.settings=Settings()
-        s.setWindowTitle("办公助手"); s.resize(960,600)
-        s._cur="全部"
+        s.setWindowTitle("办公助手"); s.resize(960,620)
+        s._cur="全部"; s._lrd=""
         s.ui(); s.tray(); s.refresh()
-
         s.rt=QTimer(s); s.rt.timeout.connect(s.check_r); s.rt.start(30000)
+        s.ct=QTimer(s); s.ct.timeout.connect(s._update_clock); s.ct.start(1000)
         s.st=QTimer(s); s.st.timeout.connect(s.sync)
         if s.settings.data.get("watch_dirs"): s.st.start(300000)
 
@@ -176,24 +166,44 @@ class MainWindow(QMainWindow):
         s.tw.currentChanged.connect(s._tc)
         ml.addWidget(s.tw)
 
-        br=QHBoxLayout(); br.setSpacing(4)
+        bot=QHBoxLayout(); bot.setSpacing(4)
         bts=[("+ 添加",s.add,"#333"),("📂 批量导入",s.batch,"#1565C0"),("🕐 自定义",s.custom,"#6A1B9A"),
              ("✏️ 修改",s.edit,"#333"),("📁 打开",s.open_sel,"#333"),("🗑 删除",s.delete,"#C62828"),
              ("🏷 标签管理",s.mtab,"#E65100")]
         for txt,cb,cl in bts:
             btn=QPushButton(txt); btn.clicked.connect(cb); btn.setMinimumHeight(32)
             if cl!="#333": btn.setStyleSheet(f"QPushButton{{font-weight:bold;color:{cl};}}")
-            br.addWidget(btn)
-        br.addStretch(); ml.addLayout(br); s.setCentralWidget(c)
+            bot.addWidget(btn)
+        bot.addStretch()
+
+        s.cf=QFrame(); s.cf.setFrameShape(QFrame.StyledPanel)
+        s.cf.setStyleSheet("QFrame{background:#1565C0;border-radius:8px;padding:4px 12px;}")
+        clk=QVBoxLayout(s.cf); clk.setContentsMargins(14,6,14,6); clk.setSpacing(0)
+        s.dlbl=QLabel(); s.dlbl.setStyleSheet("color:white;font-size:13px;")
+        s.tlbl=QLabel(); s.tlbl.setStyleSheet("color:white;font-size:20px;font-weight:bold;")
+        s.dlbl.setAlignment(Qt.AlignCenter); s.tlbl.setAlignment(Qt.AlignCenter)
+        clk.addWidget(s.dlbl); clk.addWidget(s.tlbl)
+        bot.addWidget(s.cf)
+        s._update_clock()
+        ml.addLayout(bot); s.setCentralWidget(c)
+
+    def _update_clock(s):
+        now=datetime.now()
+        wd=["周一","周二","周三","周四","周五","周六","周日"]
+        s.dlbl.setText(now.strftime("%Y年%m月%d日 ")+wd[now.weekday()])
+        s.tlbl.setText(now.strftime("%H:%M:%S"))
 
     def _rebuild(s):
         s.tw.blockSignals(True); s.tw.clear(); s.lists.clear()
         s.torder=["全部"]+s.settings.tab_order()+["自定义"]
         for lb in s.torder:
             lst=QListWidget(); lst.setAlternatingRowColors(True)
+            lst.setFont(QFont("Microsoft YaHei",11))
+            lst.setStyleSheet("QListWidget::item{padding:4px 8px;}")
             lst.setContextMenuPolicy(Qt.CustomContextMenu)
             lst.customContextMenuRequested.connect(s._ctx)
             lst.itemDoubleClicked.connect(s._dbl)
+            lst.itemClicked.connect(s._hit)
             s.tw.addTab(lst,f"  {lb}  "); s.lists[lb]=lst
         s.tw.blockSignals(False)
 
@@ -228,6 +238,8 @@ class MainWindow(QMainWindow):
         today=QDate.currentDate().toString("yyyy-MM-dd")
         if s._cur not in s.lists: s._cur="全部"
         for tn,lst in s.lists.items():
+            idx=s.torder.index(tn) if tn in s.torder else 0
+            sb=lst.verticalScrollBar().value()
             lst.clear()
             tasks=sorted(s._flt(tn),key=s._sk)
             for t in tasks:
@@ -239,20 +251,39 @@ class MainWindow(QMainWindow):
                 txt=f"{chk}  {t['name']}     {bel}"
                 item=QListWidgetItem(txt)
                 item.setData(Qt.UserRole,t)
-                if done: item.setForeground(Qt.gray)
-                elif not pok: item.setForeground(QColor(200,50,50)); item.setText(f"{chk}  {t['name']} ❌失效")
-                elif not al: item.setForeground(QColor(150,150,150))
-                item.setToolTip(f"路径:{t.get('path','(自定义)')}\n类型:{t.get('type','')}\n闹钟:{'开' if al else '关'}")
+                if done:
+                    item.setForeground(QColor(150,150,150))
+                elif not pok:
+                    item.setForeground(QColor(200,50,50))
+                    item.setText(f"☐  {t['name']} ❌失效")
+                else:
+                    item.setForeground(QColor(0,0,0))
+                item.setToolTip(f"路径:{t.get('path','(自定义)')}\n类型:{t.get('type','')}")
                 lst.addItem(item)
             cnt=len(tasks)
-            idx=s.torder.index(tn) if tn in s.torder else 0
             s.tw.setTabText(idx,f"  {tn}（{cnt}）" if cnt else f"  {tn}  ")
+            lst.verticalScrollBar().setValue(min(sb,lst.verticalScrollBar().maximum()))
         if s._cur in s.lists:
             idx=s.torder.index(s._cur) if s._cur in s.torder else 0
             s.tw.setCurrentIndex(idx)
 
     def _tc(s,idx):
         if idx<len(s.torder): s._cur=s.torder[idx]
+
+    def _hit(s,item):
+        t=item.data(Qt.UserRole)
+        if not t: return
+        today=QDate.currentDate().toString("yyyy-MM-dd")
+        cur=t.get("last_done")
+        t["last_done"]="" if cur==today else today
+        s.mgr.save()
+        done=(t.get("last_done")==today)
+        al=t.get("alarm_enabled",True); pok=t.get("is_custom") or os.path.exists(t.get("path",""))
+        chk="☑" if done else "☐"; bel="🔔" if al else "🔕"
+        item.setText(f"{chk}  {t['name']}     {bel}")
+        if done: item.setForeground(QColor(150,150,150))
+        elif not pok: item.setForeground(QColor(200,50,50))
+        else: item.setForeground(QColor(0,0,0))
 
     def _ctx(s,pos):
         lst=s._cl(); item=lst.itemAt(pos)
@@ -276,6 +307,7 @@ class MainWindow(QMainWindow):
     def _sel(s):
         item=s._cl().currentItem()
         return item.data(Qt.UserRole) if item else None
+
     def _idx(s):
         t=s._sel()
         if t:
@@ -297,7 +329,7 @@ class MainWindow(QMainWindow):
 
     def edit(s):
         idx=s._idx()
-        if idx<0: QMessageBox.information(s,"提示","请选中任务"); return
+        if idx<0: QMessageBox.information(s,"提示","请先选中"); return
         t=s.mgr.tasks[idx]
         if t.get("is_custom"): dlg=CustomDialog(s,t)
         else: dlg=TaskDialog(s,t,s.settings.tab_order(),t.get("type","每日"))
@@ -346,11 +378,11 @@ class MainWindow(QMainWindow):
             t={"name":d,"path":fp,"type":lb,"remind_time":"09:00","remind_day":dy,"interval":30,
                "alarm_enabled":False,"last_done":"","last_reminded":"","is_custom":False,
                "use_specific_date":False,"remind_date":""}
-            s.mgr.tasks.append(t); imp.append(f"  {d} -> {lb}")
+            s.mgr.tasks.append(t); imp.append(f"{d} -> {lb}")
         if parent not in s.settings.data.get("watch_dirs",[]):
             s.settings.data.setdefault("watch_dirs",[]).append(parent); s.settings.save(); s.st.start(300000)
         s.mgr.save(); s.refresh()
-        QMessageBox.information(s,"导入结果",f"✅ {len(imp)} 个(默认🔕)\n⏭ 跳过 {len(skp)} 个")
+        QMessageBox.information(s,"导入",f"✅ {len(imp)} 个(默认🔕)\n⏭ 跳过 {len(skp)} 个")
 
     def sync(s):
         for parent in s.settings.data.get("watch_dirs",[]):
@@ -371,8 +403,8 @@ class MainWindow(QMainWindow):
             for op in (mg-cur):
                 s.mgr.rm_by_path(op); rm.append(os.path.basename(op))
             if ad or rm: s.mgr.save(); s.refresh()
-            if ad: s.tray.showMessage("同步",f"新增 {len(ad)} 个文件夹",QSystemTrayIcon.Information,3000)
-            if rm: s.tray.showMessage("同步",f"移除 {len(rm)} 个文件夹",QSystemTrayIcon.Information,3000)
+            if ad: s.tray.showMessage("同步",f"+{len(ad)} 个文件夹",QSystemTrayIcon.Information,3000)
+            if rm: s.tray.showMessage("同步",f"-{len(rm)} 个文件夹",QSystemTrayIcon.Information,3000)
 
     def mtab(s):
         dlg=ManageTabs(s,s.settings)
@@ -400,9 +432,7 @@ class MainWindow(QMainWindow):
 
     def check_r(s):
         now=datetime.now(); today=now.strftime("%Y-%m-%d"); ct=now.strftime("%H:%M"); cd=now.day; cw=now.weekday()
-
-        lrd=getattr(s,"_lrd","")
-        if lrd!=today:
+        if s._lrd!=today:
             s._lrd=today; rc=0
             for t in s.mgr.tasks:
                 if t.get("is_custom"): continue
@@ -472,14 +502,10 @@ class ManageTabs(QDialog):
         bl.addWidget(b1); bl.addWidget(b2); bl.addWidget(b3); lo.addLayout(bl)
         bl2=QHBoxLayout(); bl2.addStretch(); ok=QPushButton("完成"); ok.clicked.connect(s.accept); bl2.addWidget(ok); lo.addLayout(bl2)
     def _rf(s):
-        s.lw.clear()
-        s.lw.addItem("📌 每日 - 每天,每日,daily,every...")
-        s.lw.addItem("📌 每周 - 每周,周报,weekly,week")
-        s.lw.addItem("📌 每月 - 每月,月度,monthly,month")
-        s.lw.addItem("📌 间隔 - 手动指定")
+        s.lw.clear(); s.lw.addItem("📌 每日 - 每天,每日,daily..."); s.lw.addItem("📌 每周 - 每周,周报,weekly..."); s.lw.addItem("📌 每月 - 每月,月度,monthly..."); s.lw.addItem("📌 间隔 - 手动指定")
         for lb,kw in s.st.data.get("custom_tabs",{}).items(): s.lw.addItem(f"🏷 {lb} - {', '.join(kw)}")
     def _ad(s):
-        n,ok=QInputDialog.getText(s,"新建标签","标签名称:"); 
+        n,ok=QInputDialog.getText(s,"新建标签","标签名称:")
         if not ok or not n.strip(): return
         n=n.strip()
         if n in BUILTIN_TABS or n in ("全部","自定义"): QMessageBox.warning(s,"错误","名称冲突"); return
