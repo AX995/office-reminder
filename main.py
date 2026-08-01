@@ -194,8 +194,16 @@ class MainWindow(QMainWindow):
         s.tlbl.setText(now.strftime("%H:%M:%S"))
 
     def _rebuild(s):
-        s.tw.blockSignals(True); s.tw.clear(); s.lists.clear()
+        s.tw.blockSignals(True)
+        while s.tw.count()>0: s.tw.removeTab(0)
+        s.lists.clear()
         s.torder=["全部"]+s.settings.tab_order()+["自定义"]
+        seen=set()
+        dedup=[]
+        for lb in s.torder:
+            if lb not in seen:
+                seen.add(lb); dedup.append(lb)
+        s.torder=dedup
         for lb in s.torder:
             lst=QListWidget(); lst.setAlternatingRowColors(True)
             lst.setFont(QFont("Microsoft YaHei",11))
