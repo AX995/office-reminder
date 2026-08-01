@@ -1,0 +1,8 @@
+# 办公文件夹统一管理助手
+
+windows/
+__pycache__/
+*.spec
+dist/
+build/
+*.pyc
