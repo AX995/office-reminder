@@ -635,6 +635,43 @@ class MainWindow(QMainWindow):
     def check_reminders(self):
         now = datetime.now(); today = now.strftime("%Y-%m-%d"); ct = now.strftime("%H:%M")
         cd = now.day; cw = now.weekday()
+
+        # ---- 自动重置已完成标记 ----
+        # 只在每天第一次检测到跨天时重置
+        last_reset_date = getattr(self, "_last_reset_date", "")
+        if last_reset_date != today:
+            self._last_reset_date = today
+            reset_count = 0
+            for t in self.mgr.tasks:
+                tp = t.get("type", "每日")
+                if t.get("is_custom_reminder"):
+                    continue
+                last = t.get("last_done", "")
+                if not last:
+                    continue
+
+                should_reset = False
+                if tp == "每日":
+                    # 每天零点后重置
+                    if last != today:
+                        should_reset = True
+                elif tp == "每周":
+                    # 每周一凌晨重置
+                    if cw == 0 and last != today:
+                        should_reset = True
+                elif tp == "每月":
+                    # 每月1号凌晨重置
+                    if cd == 1 and last != today:
+                        should_reset = True
+
+                if should_reset:
+                    t["last_done"] = ""
+                    reset_count += 1
+
+            if reset_count:
+                self.mgr.save()
+        # ---- 重置完毕，继续正常提醒 ----
+
         for t in self.mgr.tasks:
             if t.get("last_done") == today: continue
             if not t.get("alarm_enabled", True): continue
