@@ -411,37 +411,25 @@ class MainWindow(QMainWindow):
             for t in tasks:
                 is_done = (t.get("last_done") == today)
                 path_ok = t.get("is_custom_reminder") or os.path.exists(t.get("path",""))
+                alarm_on = t.get("alarm_enabled", True)
 
-                # 构建显示 widget
-                row_w = QWidget()
-                row_l = QHBoxLayout(row_w); row_l.setContentsMargins(4,2,4,2); row_l.setSpacing(6)
+                # 简洁纯文本显示（无自定义 widget，避免跨平台渲染问题）
+                chk = "☑" if is_done else "☐"
+                bell = "🔔" if alarm_on else "🔕"
+                text = f"{chk}  {t['name']}     {bell}"
 
-                # 左侧复选框
-                cb = QCheckBox(); cb.setChecked(is_done)
-                cb.toggled.connect(lambda checked, tk=t: self._on_checkbox(tk, checked))
-                row_l.addWidget(cb)
-
-                # 名称
-                name_lbl = QLabel(t["name"])
-                if is_done:
-                    name_lbl.setStyleSheet("color:gray; text-decoration:line-through;")
-                elif not path_ok:
-                    name_lbl.setStyleSheet("color:red;")
-                row_l.addWidget(name_lbl)
-                row_l.addStretch()
-
-                # 右侧闹钟图标
-                alarm_lbl = QLabel("🔕" if not t.get("alarm_enabled", True) else "🔔")
-                alarm_lbl.setToolTip("闹钟已关闭" if not t.get("alarm_enabled", True) else "闹钟已开启")
-                alarm_lbl.mousePressEvent = lambda e, tk=t, al=alarm_lbl: self._toggle_alarm_icon(tk, al)
-                row_l.addWidget(alarm_lbl)
-
-                # 存储数据
-                item = QListWidgetItem()
-                item.setSizeHint(row_w.sizeHint())
+                item = QListWidgetItem(text)
                 item.setData(Qt.UserRole, t)
+                if is_done:
+                    item.setForeground(Qt.gray)
+                elif not path_ok:
+                    item.setForeground(Qt.red)
+                    item.setText(f"{chk}  {t['name']} ❌失效")
+                elif not alarm_on:
+                    item.setForeground(QColor(150, 150, 150))
+
+                item.setToolTip(f"路径: {t.get('path','(自定义)')}\n类型: {t.get('type','')}\n闹钟: {'开' if alarm_on else '关'}")
                 lst.addItem(item)
-                lst.setItemWidget(item, row_w)
 
             cnt = len(tasks)
             idx = self.tab_order.index(tab_name) if tab_name in self.tab_order else 0
@@ -450,16 +438,6 @@ class MainWindow(QMainWindow):
         if self._current_tab in self.tab_lists:
             idx = self.tab_order.index(self._current_tab) if self._current_tab in self.tab_order else 0
             self.tab_widget.setCurrentIndex(idx)
-
-    def _on_checkbox(self, task, checked):
-        today = QDate.currentDate().toString("yyyy-MM-dd")
-        task["last_done"] = today if checked else ""
-        self.mgr.save(); self.refresh_all()
-
-    def _toggle_alarm_icon(self, task, lbl):
-        task["alarm_enabled"] = not task.get("alarm_enabled", True)
-        lbl.setText("🔕" if not task["alarm_enabled"] else "🔔")
-        self.mgr.save()
 
     def on_tab_changed(self, idx):
         if idx < len(self.tab_order): self._current_tab = self.tab_order[idx]
