@@ -11,8 +11,46 @@ from PySide6.QtWidgets import (
     QDialog, QFormLayout, QLineEdit, QCheckBox, QGroupBox, QStyle
 )
 from PySide6.QtGui import QIcon, QAction
+import re
 
 CONFIG_FILE = "config.json"
+
+# ---------- 文件夹名自动分类 ----------
+# 匹配规则：按关键词识别任务类型，优先级从高到低
+CLASSIFY_RULES = [
+    (r"(?:每周|周报|weekly|week)",    "每周任务"),
+    (r"(?:每月|月度|月报|monthly|month)",  "每月固定日任务"),
+    (r"(?:每天|每日|日报|daily|每\s*天|每\s*日)", "每日任务"),
+    (r"(?:每|every)",                "每日任务"),   # 模糊"每"字兜底
+]
+
+
+def classify_folder_name(dirname: str) -> str:
+    """根据文件夹名识别任务类型，默认返回每日任务"""
+    for pattern, task_type in CLASSIFY_RULES:
+        if re.search(pattern, dirname, re.IGNORECASE):
+            return task_type
+    return "每日任务"
+
+
+def extract_day_from_name(dirname: str) -> int:
+    """尝试从文件夹名中提取日期（支持中英文数字）；失败返回 1"""
+    # 数字格式: 每月5号 / 5号 / 月5 / day5 / 5th
+    m = re.search(r"(\d+)\s*(?:号|日|th|st|nd|rd)?", dirname, re.IGNORECASE)
+    if m:
+        day = int(m.group(1))
+        return max(1, min(day, 31))
+    # 中文数字简写
+    cn = {"一":1,"二":2,"三":3,"四":4,"五":5,"六":6,"七":7,"八":8,"九":9,"十":10,
+          "十一":11,"十二":12,"十三":13,"十四":14,"十五":15,"十六":16,"十七":17,
+          "十八":18,"十九":19,"二十":20,"二十一":21,"二十二":22,"二十三":23,
+          "二十四":24,"二十五":25,"二十六":26,"二十七":27,"二十八":28,
+          "二十九":29,"三十":30,"三十一":31}
+    for word, num in sorted(cn.items(), key=lambda x: -len(x[0])):
+        if word in dirname:
+            return num
+    return 1
+
 
 class TaskManager:
     """数据管理类，负责配置的读取与保存"""
@@ -63,7 +101,7 @@ class TaskDialog(QDialog):
 
         # 3. 分类标签
         self.type_combo = QComboBox()
-        self.type_combo.addItems(["每日任务", "每月固定日任务", "间隔时间提醒"])
+        self.type_combo.addItems(["每日任务", "每周任务", "每月固定日任务", "间隔时间提醒"])
         current_type = self.task_data.get("type", "每日任务")
         self.type_combo.setCurrentText(current_type)
         self.type_combo.currentTextChanged.connect(self.on_type_changed)
@@ -126,7 +164,7 @@ class TaskDialog(QDialog):
                 self.name_input.setText(os.path.basename(path))
 
     def on_type_changed(self, text):
-        if text == "每日任务":
+        if text in ("每日任务", "每周任务"):
             self.day_widget.hide()
             self.time_widget.show()
             self.interval_widget.hide()
@@ -181,6 +219,10 @@ class MainWindow(QMainWindow):
         add_btn = QPushButton("添加新文件夹")
         add_btn.clicked.connect(self.add_task)
         
+        import_btn = QPushButton("批量导入文件夹")
+        import_btn.setStyleSheet("QPushButton { font-weight: bold; color: #1565C0; }")
+        import_btn.clicked.connect(self.batch_import)
+
         edit_btn = QPushButton("修改设置")
         edit_btn.clicked.connect(self.edit_task)
 
@@ -194,6 +236,7 @@ class MainWindow(QMainWindow):
         del_btn.clicked.connect(self.delete_task)
 
         btn_layout.addWidget(add_btn)
+        btn_layout.addWidget(import_btn)
         btn_layout.addWidget(edit_btn)
         btn_layout.addWidget(open_btn)
         btn_layout.addWidget(done_btn)
@@ -333,13 +376,19 @@ class MainWindow(QMainWindow):
                 if t["remind_time"] == current_time_str and t.get("last_reminded") != f"{today_str}_{current_time_str}":
                     should_remind = True
 
-            # 2. 每月固定日判定
+            # 2. 每周任务判定（只在周一提醒）
+            elif t["type"] == "每周任务":
+                if now.weekday() == 0 and t["remind_time"] == current_time_str:
+                    if t.get("last_reminded") != f"{today_str}_{current_time_str}":
+                        should_remind = True
+
+            # 3. 每月固定日判定
             elif t["type"] == "每月固定日任务":
                 if current_day == t["remind_day"] and t["remind_time"] == current_time_str:
                     if t.get("last_reminded") != f"{today_str}_{current_time_str}":
                         should_remind = True
 
-            # 3. 间隔提醒判定
+            # 4. 间隔提醒判定
             elif t["type"] == "间隔时间提醒":
                 last_time_str = t.get("last_interval_check")
                 if not last_time_str:
@@ -353,6 +402,70 @@ class MainWindow(QMainWindow):
                 t["last_reminded"] = f"{today_str}_{current_time_str}"
                 self.mgr.save_tasks()
                 self.trigger_alert(t)
+
+    def batch_import(self):
+        """批量导入：选择一个父目录，扫描子文件夹并按命名自动分类"""
+        parent_dir = QFileDialog.getExistingDirectory(self, "选择包含办公文件夹的父目录")
+        if not parent_dir:
+            return
+
+        try:
+            entries = os.listdir(parent_dir)
+        except OSError as e:
+            QMessageBox.warning(self, "错误", f"无法读取目录：\n{e}")
+            return
+
+        # 只取子文件夹
+        subdirs = [
+            d for d in entries
+            if os.path.isdir(os.path.join(parent_dir, d))
+        ]
+        if not subdirs:
+            QMessageBox.information(self, "提示", "所选目录下没有子文件夹。")
+            return
+
+        # 扫描 → 自动分类
+        imported = []
+        skipped = []
+        for d in sorted(subdirs):
+            full_path = os.path.join(parent_dir, d)
+            task_type = classify_folder_name(d)
+            remind_day = extract_day_from_name(d)
+
+            # 检查是否已存在相同路径的任务
+            if any(t.get("path") == full_path for t in self.mgr.tasks):
+                skipped.append(d)
+                continue
+
+            task = {
+                "name": d,
+                "path": full_path,
+                "type": task_type,
+                "remind_time": "09:00",
+                "remind_day": remind_day,
+                "interval": 60,
+                "last_done": "",
+                "last_reminded": "",
+            }
+            self.mgr.tasks.append(task)
+            imported.append(f"  📁 {d}  →  {task_type}（每月{remind_day}号）"
+                            if task_type == "每月固定日任务"
+                            else f"  📁 {d}  →  {task_type}")
+
+        self.mgr.save_tasks()
+        self.load_list()
+
+        # 结果弹窗
+        msg = f"导入完成！\n\n✅ 成功导入 {len(imported)} 个文件夹：\n"
+        msg += "\n".join(imported[:20])  # 最多展示前20条
+        if len(imported) > 20:
+            msg += f"\n  ... 还有 {len(imported) - 20} 个"
+        if skipped:
+            msg += f"\n\n⏭ 跳过 {len(skipped)} 个（已存在）：{', '.join(skipped[:10])}"
+            if len(skipped) > 10:
+                msg += f" ... 等"
+
+        QMessageBox.information(self, "批量导入结果", msg)
 
     def trigger_alert(self, task):
         """右下角弹窗提醒 + 蜂鸣声音"""
